@@ -1,7 +1,5 @@
 # Deploy state_guard on a Hermes host
 
-No secrets in this repo. No tokens in cron JSON.
-
 ## 1. Copy the script
 
 On the Hermes host (example paths; set `HERMES_HOME` if yours is not `~/.hermes`):
