@@ -76,7 +76,7 @@ inspect quarantined files under the live DB directory.
 
 If every snapshot fails `quick_check`, the script does not invent a database.
 
-If Mnemosyne is corrupt while `hermes-gateway.service` is active, the script refuses auto-restore and alerts instead of performing a live swap.
+If Mnemosyne is corrupt while another process holds the database, the script refuses auto-restore and alerts instead of performing a live swap. The check is a short exclusive lock. It does not call systemctl.
 
 ## 6. What this is not
 

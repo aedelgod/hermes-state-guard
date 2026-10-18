@@ -19,7 +19,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import time
@@ -243,6 +242,29 @@ class DatabaseTargetGuard:
         self.sweep_orphans()
         return pruned
 
+    def _another_process_holds_database(self) -> bool:
+        """True only when another process holds a lock. A corrupt file is not a lock."""
+        if not self.db_path.exists():
+            return False
+        uri = f"file:{self.db_path.as_posix()}?mode=rw"
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.0)
+        except sqlite3.Error as exc:
+            return self._is_lock_error(exc)
+        try:
+            conn.execute("BEGIN EXCLUSIVE")
+            conn.rollback()
+            return False
+        except sqlite3.Error as exc:
+            return self._is_lock_error(exc)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _is_lock_error(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return "locked" in text or "busy" in text
+
     def auto_restore_if_corrupt(self) -> Tuple[bool, str]:
         """
         Inspects live DB. If corrupted or missing:
@@ -255,20 +277,15 @@ class DatabaseTargetGuard:
         if is_healthy:
             return False, f"Live {self.display_name} is healthy."
 
-        # Hold auto-restore for Mnemosyne while the gateway is up.
-        if self.target_id == "mnemosyne_db":
-            probe = subprocess.run(
-                ["systemctl", "is-active", "--quiet", "hermes-gateway.service"],
-                check=False,
+        # Hold Mnemosyne auto-restore while another process has the file open.
+        if self.target_id == "mnemosyne_db" and self._another_process_holds_database():
+            msg = (
+                f"CORRUPTION DETECTED on {self.display_name} ({reason}) but "
+                f"another process holds the database; refusing auto-restore. "
+                f"Stop the process that has it open, then restore from a verified .bak."
             )
-            if probe.returncode == 0:
-                msg = (
-                    f"CORRUPTION DETECTED on {self.display_name} ({reason}) but "
-                    f"hermes-gateway is running; refusing auto-restore. "
-                    f"Recycle the gateway, then restore from a verified .bak."
-                )
-                logger.critical(f"[{self.target_id}] {msg}")
-                return True, msg
+            logger.critical(f"[{self.target_id}] {msg}")
+            return True, msg
 
         logger.critical(f"[{self.target_id}] CORRUPTION DETECTED: {reason}. Initiating auto-recovery...")
 

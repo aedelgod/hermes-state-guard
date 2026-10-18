@@ -3,9 +3,9 @@
 Stdlib tests for state_guard.py safety fixes.
 
   1. create_backup calls sqlite3 Connection.backup with pages=BACKUP_PAGES_PER_STEP (100).
-  2. When the systemctl gateway probe returns 0, a corrupt mnemosyne_db file
-     is not moved and the message contains 'refusing auto-restore'.
-  3. When the probe returns non-zero, the hold does not block (file is quarantined).
+  2. When another process holds mnemosyne.db, a corrupt file is left in place
+     and the message contains 'refusing auto-restore'.
+  3. When the file is free, or the error is not a lock, restore proceeds.
 
 These tests never open /root/.hermes databases: HOME is redirected to a temp
 directory before the module is imported.
@@ -17,7 +17,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Redirect HOME to a throwaway temp dir so module-level code
 # (~/.hermes resolution, log file handler) never touches /root/.hermes.
@@ -82,45 +82,86 @@ class TestPagedBackup(unittest.TestCase):
             self.assertEqual(kw["pages"], 100)
 
 
-class TestGatewayHold(unittest.TestCase):
-    def _make_target(self, tmpdir):
+class TestLockHold(unittest.TestCase):
+    def _make_target(self, tmpdir, target_id="mnemosyne_db"):
         db_path = tmpdir / "mnemosyne.db"
         target = state_guard.DatabaseTargetGuard(
-            target_id="mnemosyne_db",
+            target_id=target_id,
             display_name="Mnemosyne Memory DB",
             db_path=db_path,
             backup_dir=tmpdir / "backups",
         )
         return db_path, target
 
-    def test_hold_blocks_when_gateway_active(self):
-        """Probe returncode 0: file not moved, message contains 'refusing auto-restore'."""
-        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_active_"))
+    def _valid_db(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.commit()
+        conn.close()
+
+    def test_hold_blocks_when_database_locked(self):
+        """A live exclusive lock leaves the file in place and alerts."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_locked_"))
         db_path, target = self._make_target(tmpdir)
-        make_corrupt_db(db_path)
+        self._valid_db(db_path)
+        holder = sqlite3.connect(str(db_path))
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            with patch.object(target, "verify_integrity", return_value=(False, "quick_check failed")):
+                restored, msg = target.auto_restore_if_corrupt()
+        finally:
+            holder.rollback()
+            holder.close()
 
-        fake_proc = MagicMock(returncode=0)
-        with patch.object(state_guard.subprocess, "run", return_value=fake_proc) as mock_run:
-            restored, msg = target.auto_restore_if_corrupt()
-
-        self.assertTrue(mock_run.called, "systemctl probe should have been invoked")
         self.assertTrue(restored, "auto_restore_if_corrupt must return True for cron notice")
         self.assertIn("refusing auto-restore", msg)
-        self.assertTrue(db_path.exists(), "corrupt file must not be moved while gateway is up")
+        self.assertNotIn("systemctl", msg)
+        self.assertTrue(db_path.exists(), "locked file must not be moved")
 
-    def test_hold_does_not_block_when_gateway_inactive(self):
-        """Probe non-zero: hold does not block, file is quarantined, no refusal message."""
-        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_inactive_"))
+    def test_hold_does_not_block_when_database_free(self):
+        """A free corrupt file is quarantined. No refusal message."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_free_"))
         db_path, target = self._make_target(tmpdir)
         make_corrupt_db(db_path)
 
-        fake_proc = MagicMock(returncode=3)
-        with patch.object(state_guard.subprocess, "run", return_value=fake_proc) as mock_run:
-            restored, msg = target.auto_restore_if_corrupt()
+        restored, msg = target.auto_restore_if_corrupt()
 
-        self.assertTrue(mock_run.called, "systemctl probe should have been invoked")
-        self.assertFalse(db_path.exists(), "corrupt file should be quarantined when gateway is down")
+        self.assertFalse(db_path.exists(), "free corrupt file should be quarantined")
         self.assertNotIn("refusing auto-restore", msg)
+        self.assertIsInstance(restored, bool)
+
+    def test_not_a_database_is_not_a_lock(self):
+        """'file is not a database' must not be treated as a held lock."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_nota_"))
+        db_path, target = self._make_target(tmpdir)
+        make_corrupt_db(db_path)
+
+        held = target._another_process_holds_database()
+
+        self.assertFalse(held)
+
+    def test_other_target_restores_even_if_locked(self):
+        """The lock hold applies only to mnemosyne_db."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="sg_hold_other_"))
+        db_path, target = self._make_target(tmpdir, target_id="state_db")
+        self._valid_db(db_path)
+        holder = sqlite3.connect(str(db_path))
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            with patch.object(target, "verify_integrity", return_value=(False, "quick_check failed")):
+                restored, msg = target.auto_restore_if_corrupt()
+        finally:
+            holder.rollback()
+            holder.close()
+
+        self.assertNotIn("refusing auto-restore", msg)
+        self.assertFalse(db_path.exists(), "a non-Mnemosyne target must still be quarantined")
+        self.assertIsInstance(restored, bool)
+
+    def test_script_does_not_call_systemctl(self):
+        source = Path(state_guard.__file__).read_text()
+        self.assertNotIn("systemctl", source)
+        self.assertNotIn("subprocess", source)
 
 
 if __name__ == "__main__":

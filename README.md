@@ -5,6 +5,8 @@ Stdlib-only SQLite watchdog for Hermes.
 Every 15 minutes it integrity-checks live databases, takes a verified snapshot
 with the SQLite backup API, keeps exactly 7 copies per target, and auto-restores
 from the newest good copy if the live file is missing or fails `PRAGMA quick_check`.
+Mnemosyne auto-restore is refused while another process holds that database.
+See `CHANGELOG.md`.
 
 Default targets:
 
