@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -35,6 +36,9 @@ MAX_BACKUPS_PER_TARGET = 7
 MIN_BACKUP_SIZE_BYTES = 5 * 1024  # 5 KB floor
 MAX_ALLOWED_SHRINKAGE_PCT = 30.0  # Alert if size drops >30% vs prior snapshot
 MAX_ALLOWED_GROWTH_PCT = 150.0  # Warning if size grows >150% unexpectedly
+
+# Yield during sqlite backup so a large copy does not stall the live gateway.
+BACKUP_PAGES_PER_STEP = 100
 
 # Logging Setup
 DEFAULT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +190,8 @@ class DatabaseTargetGuard:
 
             try:
                 dest_conn.execute("PRAGMA journal_mode=OFF")
-                src_conn.backup(dest_conn)
+                # Page the copy so the live gateway isn't stalled.
+                src_conn.backup(dest_conn, pages=BACKUP_PAGES_PER_STEP)
                 dest_conn.commit()
             finally:
                 dest_conn.close()
@@ -249,6 +254,21 @@ class DatabaseTargetGuard:
         is_healthy, reason = self.verify_integrity(self.db_path, fast=False)
         if is_healthy:
             return False, f"Live {self.display_name} is healthy."
+
+        # Hold auto-restore for Mnemosyne while the gateway is up.
+        if self.target_id == "mnemosyne_db":
+            probe = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "hermes-gateway.service"],
+                check=False,
+            )
+            if probe.returncode == 0:
+                msg = (
+                    f"CORRUPTION DETECTED on {self.display_name} ({reason}) but "
+                    f"hermes-gateway is running; refusing auto-restore. "
+                    f"Recycle the gateway, then restore from a verified .bak."
+                )
+                logger.critical(f"[{self.target_id}] {msg}")
+                return True, msg
 
         logger.critical(f"[{self.target_id}] CORRUPTION DETECTED: {reason}. Initiating auto-recovery...")
 

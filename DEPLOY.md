@@ -76,6 +76,8 @@ inspect quarantined files under the live DB directory.
 
 If every snapshot fails `quick_check`, the script does not invent a database.
 
+If Mnemosyne is corrupt while `hermes-gateway.service` is active, the script refuses auto-restore and alerts instead of performing a live swap.
+
 ## 6. What this is not
 
 - Not 7 days of backups.
